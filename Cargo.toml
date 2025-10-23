@@ -2,6 +2,8 @@
 name = "mad-useful"
 version = "0.1.0"
 edition = "2024"
+description = "A multi-tool utility for file operations and text processing"
+license = "MIT"
 
 [[bin]]
 name = "madu"
