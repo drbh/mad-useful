@@ -1,44 +1,100 @@
-mod analysis;
-mod args;
-mod display;
-mod file_utils;
-mod git;
-mod watch;
-
-use analysis::{
+use crate::analysis::{
     analyze_emojis, calculate_code_density, calculate_complexity, calculate_duplication_percentage,
     calculate_max_indent_level,
 };
-use args::Args;
-use clap::Parser;
-use display::print_colored_count;
-use file_utils::{
+use crate::args::Args;
+use crate::display::print_colored_count;
+use crate::file_utils::{
     count_lines, count_nonwhitespace_chars, format_size, get_file_size, is_noise_file,
     should_include,
 };
-use git::{
+use crate::git::{
     calculate_churn, calculate_file_age_days, calculate_isolation_percentage,
     calculate_ownership_percentage, calculate_rhythm_score, get_primary_author,
 };
 use ignore::WalkBuilder;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use termcolor::{ColorChoice, StandardStream};
-use watch::watch_mode;
 
-fn main() {
-    let args = Args::parse();
+pub fn watch_mode(args: &Args, interval_secs: u64) {
+    let mut _last_run = Instant::now();
+    let watch_interval = Duration::from_secs(interval_secs);
+    let mut last_values: HashMap<PathBuf, usize> = HashMap::new();
+    let mut start_values: HashMap<PathBuf, usize> = HashMap::new();
+    let start_time = Instant::now();
+    let mut iteration_count = 0;
 
-    if let Some(interval) = args.watch {
-        watch_mode(&args, interval);
-        return;
+    // Set up signal handler to restore cursor on exit
+    let _ = ctrlc::set_handler(move || {
+        print!("\x1B[?25h"); // Show cursor
+        std::process::exit(0);
+    });
+
+    println!(
+        "Watching {} every {}s (Press Ctrl+C to stop)",
+        args.path, interval_secs
+    );
+    println!();
+
+    let mut first_run = true;
+
+    loop {
+        let loop_start = Instant::now();
+        iteration_count += 1;
+
+        if first_run {
+            // Initial clear screen and hide cursor
+            print!("\x1B[2J\x1B[1;1H\x1B[?25l");
+        } else {
+            // Clear screen to handle shorter lists
+            print!("\x1B[2J\x1B[1;1H");
+        }
+
+        let elapsed_total = start_time.elapsed().as_secs();
+        println!("Started: {elapsed_total}s ago | Iterations: {iteration_count}");
+        println!(
+            "Last update: {:2}s ago | Watching {} every {}s (Ctrl+C to stop)",
+            0, args.path, interval_secs
+        );
+        run_analysis_with_changes(args, &mut last_values, &mut start_values, first_run);
+
+        // Update timer and wait
+        _last_run = loop_start;
+
+        if first_run {
+            first_run = false;
+        }
+
+        // Sleep with periodic updates to show elapsed time
+        let sleep_duration = Duration::from_millis(100);
+        let mut total_slept = Duration::new(0, 0);
+
+        while total_slept < watch_interval {
+            std::thread::sleep(sleep_duration);
+            total_slept += sleep_duration;
+
+            // Update timestamp display
+            let elapsed = Instant::now().duration_since(_last_run).as_secs();
+            let elapsed_total = start_time.elapsed().as_secs();
+            print!("\x1B[1;1H");
+            println!("Started: {elapsed_total}s ago | Iterations: {iteration_count}\x1B[K");
+            println!(
+                "Last update: {:2}s ago | Watching {} every {}s (Ctrl+C to stop)\x1B[K",
+                elapsed, args.path, interval_secs
+            );
+        }
     }
-
-    run_analysis(&args);
 }
 
-fn run_analysis(args: &Args) {
+fn run_analysis_with_changes(
+    args: &Args,
+    last_values: &mut HashMap<PathBuf, usize>,
+    start_values: &mut HashMap<PathBuf, usize>,
+    is_first_run: bool,
+) {
     let mut stdout = StandardStream::stdout(ColorChoice::Auto);
 
     let files: Vec<PathBuf> = WalkBuilder::new(&args.path)
@@ -135,6 +191,35 @@ fn run_analysis(args: &Args) {
         .collect();
 
     let mut results = results;
+
+    // Add previously tracked files that no longer exist (show them with value 0)
+    if !is_first_run {
+        let current_files: HashSet<PathBuf> =
+            results.iter().map(|(path, _, _, _)| path.clone()).collect();
+
+        for (path, _) in last_values.iter() {
+            if !current_files.contains(path) {
+                // File was removed, add it with value 0
+                let author = if args.blame || args.author.is_some() {
+                    get_primary_author(path).unwrap_or_else(|| "unknown".to_string())
+                } else {
+                    String::new()
+                };
+
+                // Skip if author filter doesn't match
+                if let Some(filter_author) = &args.author {
+                    if !author
+                        .to_lowercase()
+                        .contains(&filter_author.to_lowercase())
+                    {
+                        continue;
+                    }
+                }
+
+                results.push((path.clone(), 0, author, String::new()));
+            }
+        }
+    }
 
     // Aggregate by directory if --dirs flag is set
     if args.dirs {
@@ -303,8 +388,43 @@ fn run_analysis(args: &Args) {
             println!(" {ext} ({files} files)");
         }
     } else {
-        for (path, count, author, extra_info) in results {
-            print_colored_count(&mut stdout, count, 1, max_lines_per_file, args.no_color);
+        for (path, count, author, extra_info) in &results {
+            print_colored_count(&mut stdout, *count, 1, max_lines_per_file, args.no_color);
+
+            // Calculate and display change deltas
+            let mut change_parts = Vec::new();
+
+            // Delta since last interval
+            if let Some(&last_value) = last_values.get(path) {
+                if *count != last_value {
+                    let delta = *count as i32 - last_value as i32;
+                    if delta > 0 {
+                        change_parts.push(format!("+{delta}"));
+                    } else {
+                        change_parts.push(format!("{delta}"));
+                    }
+                }
+            }
+
+            // Delta since start (only if not first run)
+            if !is_first_run {
+                let start_value = start_values.get(path).copied().unwrap_or(0);
+                if *count != start_value {
+                    let total_delta = *count as i32 - start_value as i32;
+                    if total_delta > 0 {
+                        change_parts.push(format!("Δ+{total_delta}"));
+                    } else {
+                        change_parts.push(format!("Δ{total_delta}"));
+                    }
+                }
+            }
+
+            let change_str = if change_parts.is_empty() {
+                String::new()
+            } else {
+                format!(" \x1B[90m({})\x1B[0m", change_parts.join(" "))
+            };
+
             if (args.emoji
                 || args.duplicates
                 || args.age
@@ -317,15 +437,30 @@ fn run_analysis(args: &Args) {
                 && !extra_info.is_empty()
             {
                 if args.blame && !author.is_empty() {
-                    println!(" {} [{}] ({})", path.display(), author, extra_info);
+                    println!(
+                        " {}{} [{}] ({})",
+                        path.display(),
+                        change_str,
+                        author,
+                        extra_info
+                    );
                 } else {
-                    println!(" {} ({})", path.display(), extra_info);
+                    println!(" {}{} ({})", path.display(), change_str, extra_info);
                 }
             } else if args.blame && !author.is_empty() {
-                println!(" {} [{}]", path.display(), author);
+                println!(" {}{} [{}]", path.display(), change_str, author);
             } else {
-                println!(" {}", path.display());
+                println!(" {}{}", path.display(), change_str);
             }
+        }
+
+        // Update tracking values for next iteration
+        for (path, count, _, _) in &results {
+            // Store start values on first run
+            if is_first_run {
+                start_values.insert(path.clone(), *count);
+            }
+            last_values.insert(path.clone(), *count);
         }
     }
 
